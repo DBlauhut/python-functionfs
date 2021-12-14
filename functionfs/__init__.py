@@ -971,7 +971,7 @@ class Function:
         """
         self._path = path
         self._ep_address_dict = ep_address_dict = {}
-        self._eventfd = eventfd = libaio.EventFD(flags=libaio.EFD_NONBLOCK)
+        self._eventfd = eventfd = {}
         flags = 0
         if all_ctrl_recip:
             flags |= ALL_CTRL_RECIP
@@ -983,12 +983,13 @@ class Function:
             hs_list=hs_list,
             ss_list=ss_list,
             os_list=os_list,
-            eventfd=eventfd,
+            eventfd=None,
         )
         self._function_strings = getStrings(dict(lang_dict))
         self._out_aio_block_list = out_aio_block_list = []
         self._out_aio_block_dict = out_aio_block_dict = {}
         self._ep_descriptor_list = ep_descriptor_list = []
+        eventfd[0] = libaio.EventFD(flags=libaio.EFD_NONBLOCK)
         for descriptor in ss_list or hs_list or fs_list:
             if descriptor.bDescriptorType == ch9.USB_DT_ENDPOINT:
                 assert descriptor.bEndpointAddress not in ep_address_dict, (
@@ -999,6 +1000,7 @@ class Function:
                 is_in = descriptor.bEndpointAddress & ch9.USB_DIR_IN
                 index = len(ep_descriptor_list)
                 ep_address_dict[descriptor.bEndpointAddress] = index
+                eventfd[descriptor.bEndpointAddress] = libaio.EventFD(flags=libaio.EFD_NONBLOCK)
                 if not is_in:
                     out_aio_block_dict[index] = ep_aio_block_list = []
                     for _ in range(out_aio_blocks_per_endpoint):
@@ -1010,13 +1012,13 @@ class Function:
                             mode=libaio.AIOBLOCK_MODE_READ,
                             buffer_list=(
                                 mmap.mmap(
-                                    -1, # Anonymous map
+                                    -1,  # Anonymous map
                                     out_aio_blocks_max_packet_count *
                                     descriptor.wMaxPacketSize,
                                 ),
                             ),
                             offset=0,
-                            eventfd=eventfd,
+                            eventfd=eventfd[descriptor.bEndpointAddress],
                         )
                         ep_aio_block_list.append(out_block)
                         out_aio_block_list.append(out_block)
@@ -1056,7 +1058,7 @@ class Function:
                     ep_file = endpoint_class(
                         path=endpoint_path,
                         submit=self._in_aio_context.submit,
-                        eventfd=self._eventfd,
+                        eventfd=self._eventfd[descriptor.bEndpointAddress],
                     )
                 else:
                     ep_file = endpoint_class(
@@ -1099,12 +1101,12 @@ class Function:
         self.__unenter()
 
     @property
-    def eventfd(self):
+    def eventfd(self, ep_address):
         """
         A file-like object which is notified of AIO operation events.
         For polling uses only.
         """
-        return self._eventfd
+        return self._eventfd[ep_address]
 
     @property
     def ep0(self):
@@ -1150,49 +1152,69 @@ class Function:
         """
         Process events until either an exception occurs or close is called.
         """
-        with select.epoll(1) as epoll:
-            epoll.register(self.eventfd, select.EPOLLIN)
-            poll = epoll.poll
-            processEvents = self.processEvents
-            while self._open:
-                try:
-                    poll()
-                except OSError as exc:
-                    if exc.errno != errno.EINTR:
-                        raise
-                else:
-                    processEvents()
+        rlist = [v.fileno() for _, v in self._eventfd.items()]
+        rlist.append(self._ep_list[0].fileno())
+        wlist = []
+        xlist = []
+        print(rlist)
+        while self._open:
+            try:
+                print('select')
+                rlist = [v.fileno() for _, v in self._eventfd.items()]
+                rlist.append(self._ep_list[0].fileno())
+                wlist = []
+                xlist = []
+                r, w, x = select.select(rlist, wlist, xlist)
 
-    def processEvents(self):
+                for fd_fileno in r:
+                    ok = False
+                    for _, v in self._eventfd.items():
+                        if v.fileno() == fd_fileno:
+                            print("serving epX %d" % fd_fileno)
+                            self.processEvents(v)
+                            ok = True
+                    if fd_fileno == self._ep_list[0].fileno():
+                        print("serving ep0 %d" % fd_fileno)
+                        self.processEvents(None)
+                        ok = True
+                    if not ok:
+                        print('unhandled file %d %d %r' % (fd_fileno, self._ep_list[0].fileno(), [v.fileno() for _, v in self._eventfd.items()]))
+            except OSError as exc:
+                if exc.errno != errno.EINTR:
+                    raise
+
+    def processEvents(self, eventfd):
         """
         Process any available event (both functionfs events and
         AIO completions).
 
         Non-blocking. Should be called whenever ep0 or eventfd become readable.
         """
-        try:
-            # Rearm before calling getEvent, so that we do not risk skipping
-            # events.
-            # Discard returned value because:
-            # - we cannot tell which AIO context has how many events ready
-            # - even if we could (which is easy: use moar eventfds !) any
-            #   discrepancy would either result in a hard-lock (waiting for
-            #   events which did not arive yet, and whose AIO blocks may not
-            #   have been submitted yet), or result in an early timeout which
-            #   would defeat the purpose of observing this count.
-            # So if this call succeeds, call non-blocking getEvents on both AIO
-            # contexts, and if it fails with EAGAIN skip this (minor
-            # optimisation, this means this was likely called to handle ep0
-            # events).
-            self._eventfd.read()
-        except IOError as exc:
-            if exc.errno != errno.EAGAIN:
-                raise
-        else:
-            self._in_aio_context.getEvents(0)
-            out_aio_context = self._out_aio_context
-            if out_aio_context is not None:
-                out_aio_context.getEvents(0)
+        if eventfd is not None:
+            try:
+                # Rearm before calling getEvent, so that we do not risk skipping
+                # events.
+                # Discard returned value because:
+                # - we cannot tell which AIO context has how many events ready
+                # - even if we could (which is easy: use moar eventfds !) any
+                #   discrepancy would either result in a hard-lock (waiting for
+                #   events which did not arive yet, and whose AIO blocks may not
+                #   have been submitted yet), or result in an early timeout which
+                #   would defeat the purpose of observing this count.
+                # So if this call succeeds, call non-blocking getEvents on both AIO
+                # contexts, and if it fails with EAGAIN skip this (minor
+                # optimisation, this means this was likely called to handle ep0
+                # events).
+                eventfd.read()
+            except IOError as exc:
+                print('O_O')
+                if exc.errno != errno.EAGAIN:
+                    raise
+            else:
+                self._in_aio_context.getEvents(0)
+                out_aio_context = self._out_aio_context
+                if out_aio_context is not None:
+                    out_aio_context.getEvents(0)
         buf = bytearray(self._ep0_event_array_size)
         length = self.ep0.readinto(buf)
         if length:
